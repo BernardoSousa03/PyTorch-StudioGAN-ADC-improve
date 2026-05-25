@@ -63,6 +63,9 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
         metric_dict_during_train.update({"IS": [], "Top1_acc": [], "Top5_acc": []})
     if "fid" in cfgs.RUN.eval_metrics:
         metric_dict_during_train.update({"FID": []})
+    if "fid_specific_classes" in cfgs.RUN.eval_metrics:
+        # FID-specific classes will be added dynamically during evaluation
+        metric_dict_during_train.update({})
     if "prdc" in cfgs.RUN.eval_metrics:
         metric_dict_during_train.update({"Improved_Precision": [], "Improved_Recall": [], "Density":[], "Coverage": []})
 
@@ -297,12 +300,36 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
         else:
             num_eval["train"], num_eval["valid"], num_eval["test"] = 50000, 50000, 50000
 
+    # Ensure generated sample count satisfies alias-specific requirements.
+    if hasattr(cfgs.RUN, "eval_num_generate_map") and cfgs.RUN.eval_num_generate_map:
+        override_max = max(cfgs.RUN.eval_num_generate_map.values())
+        if override_max > num_eval[cfgs.RUN.ref_dataset]:
+            num_eval[cfgs.RUN.ref_dataset] = override_max
+
     if len(cfgs.RUN.eval_metrics) or cfgs.RUN.intra_class_fid:
         eval_model = pp.LoadEvalModel(eval_backbone=cfgs.RUN.eval_backbone,
                                       post_resizer=cfgs.RUN.post_resizer,
                                       world_size=cfgs.OPTIMIZATION.world_size,
                                       distributed_data_parallel=cfgs.RUN.distributed_data_parallel,
-                                      device=local_rank)
+                                      device=local_rank,
+                                      clip_pkl_path=cfgs.RUN.clip_pkl_path,
+                                      vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path,
+                                      inception_pth_path=cfgs.RUN.inception_pth_path)
+
+        # When prdc_backbone is set to a different backbone than eval_backbone, load a
+        # separate model for PRDC so FID uses CLIP while PRDC uses VGG16 (or any combo).
+        _prdc_bb = cfgs.RUN.prdc_backbone
+        if _prdc_bb == "N/A" or _prdc_bb == cfgs.RUN.eval_backbone:
+            prdc_eval_model = eval_model  # same object — no extra memory
+        else:
+            prdc_eval_model = pp.LoadEvalModel(eval_backbone=_prdc_bb,
+                                               post_resizer=cfgs.RUN.post_resizer,
+                                               world_size=cfgs.OPTIMIZATION.world_size,
+                                               distributed_data_parallel=cfgs.RUN.distributed_data_parallel,
+                                               device=local_rank,
+                                               clip_pkl_path=cfgs.RUN.clip_pkl_path,
+                                               vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path,
+                                               inception_pth_path=cfgs.RUN.inception_pth_path)
 
     if "fid" in cfgs.RUN.eval_metrics:
         mu, sigma = pp.prepare_moments(data_loader=eval_dataloader,
@@ -331,7 +358,7 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
                                      drop_last=False)
 
         real_feats = pp.prepare_real_feats(data_loader=prdc_dataloader,
-                                           eval_model=eval_model,
+                                           eval_model=prdc_eval_model,
                                            num_feats=num_eval[cfgs.RUN.ref_dataset],
                                            quantize=True,
                                            cfgs=cfgs,
@@ -362,6 +389,7 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
         Gen_ema_synthesis=Gen_ema_synthesis,
         ema=ema,
         eval_model=eval_model,
+        prdc_eval_model=prdc_eval_model,
         train_dataloader=train_dataloader,
         eval_dataloader=eval_dataloader,
         global_rank=global_rank,

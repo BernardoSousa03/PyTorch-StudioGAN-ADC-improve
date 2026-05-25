@@ -633,9 +633,51 @@ class Configurations(object):
             print("Please use standing statistics (-std_stat) with -std_max and -std_step options for reliable evaluation!")
             print("-"*120)
 
+        # Normalize eval metric aliases and apply alias-specific defaults.
+        raw_metrics = list(self.RUN.eval_metrics) if isinstance(self.RUN.eval_metrics, (list, tuple)) else [self.RUN.eval_metrics]
+        alias_to_metric = {
+            "fidclip50k_full": "fid",
+            "prdc50k_full": "prdc",
+        }
+        alias_num_generate = {
+            "fidclip50k_full": 50000,
+            "fid_specific_classes": 5000,
+            "prdc50k_full": 50000,
+        }
+        if not hasattr(self.RUN, "eval_metrics_original"):
+            self.RUN.eval_metrics_original = raw_metrics
+
+        normalized_metrics = []
+        seen = set()
+        eval_num_generate_map = {}
+        for item in raw_metrics:
+            normalized_item = alias_to_metric.get(item, item)
+            if normalized_item not in seen:
+                normalized_metrics.append(normalized_item)
+                seen.add(normalized_item)
+            if item in alias_num_generate:
+                current = eval_num_generate_map.get(normalized_item, 0)
+                eval_num_generate_map[normalized_item] = max(current, alias_num_generate[item])
+
+        self.RUN.eval_metrics = normalized_metrics
+        self.RUN.eval_num_generate_map = eval_num_generate_map
+
+        # Alias-driven backbone selection (only when alias metrics are requested).
+        if any(item in raw_metrics for item in ["fidclip50k_full", "fid_specific_classes"]):
+            if self.RUN.eval_backbone != "CLIP_torch":
+                print("Overriding eval_backbone to CLIP_torch for fidclip50k_full/fid_specific_classes.")
+            self.RUN.eval_backbone = "CLIP_torch"
+
+        if "prdc50k_full" in raw_metrics:
+            if self.RUN.prdc_backbone != "VGG16_torch":
+                print("Overriding prdc_backbone to VGG16_torch for prdc50k_full.")
+            self.RUN.prdc_backbone = "VGG16_torch"
+
         if len(self.RUN.eval_metrics):
             for item in self.RUN.eval_metrics:
-                assert item in ["is", "fid", "prdc", "none"], "-metrics option can only contain is, fid, prdc or none for skipping evaluation."
+                assert item in ["is", "fid", "fid_specific_classes", "prdc", "none",
+                                "fidclip50k_full", "prdc50k_full"], \
+                    "-metrics option can only contain is, fid, fid_specific_classes, prdc or none for skipping evaluation."
 
         if self.RUN.load_data_in_memory:
             assert self.RUN.load_train_hdf5, "load_data_in_memory option is appliable with the load_train_hdf5 (-hdf5) option."
@@ -847,8 +889,11 @@ class Configurations(object):
                 self.AUG.ada_interval == self.AUG.apa_interval, \
                 "ADA and APA specifications should be the completely same."
 
-        assert self.RUN.eval_backbone in ["InceptionV3_tf", "InceptionV3_torch", "ResNet50_torch", "SwAV_torch", "DINO_torch", "Swin-T_torch"], \
-            "eval_backbone should be in [InceptionV3_tf, InceptionV3_torch, ResNet50_torch, SwAV_torch, DINO_torch, Swin-T_torch]"
+        assert self.RUN.eval_backbone in ["InceptionV3_tf", "InceptionV3_torch", "ResNet50_torch", "SwAV_torch", "DINO_torch", "Swin-T_torch", "CLIP_torch", "VGG16_torch"], \
+            "eval_backbone should be in [InceptionV3_tf, InceptionV3_torch, ResNet50_torch, SwAV_torch, DINO_torch, Swin-T_torch, CLIP_torch, VGG16_torch]"
+
+        assert self.RUN.prdc_backbone in ["N/A", "InceptionV3_tf", "InceptionV3_torch", "ResNet50_torch", "SwAV_torch", "DINO_torch", "Swin-T_torch", "CLIP_torch", "VGG16_torch"], \
+            "prdc_backbone should be in [N/A, InceptionV3_tf, InceptionV3_torch, ResNet50_torch, SwAV_torch, DINO_torch, Swin-T_torch, CLIP_torch, VGG16_torch]"
 
         assert self.RUN.post_resizer in ["legacy", "clean", "friendly"], "resizing flag should be in [legacy, clean, friendly]"
 

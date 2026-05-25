@@ -58,7 +58,7 @@ LOG_FORMAT = ("Step: {step:>6} "
 
 class WORKER(object):
     def __init__(self, cfgs, run_name, Gen, Gen_mapping, Gen_synthesis, Dis, Gen_ema, Gen_ema_mapping, Gen_ema_synthesis,
-                 ema, eval_model, train_dataloader, eval_dataloader, global_rank, local_rank, mu, sigma, real_feats, logger,
+                 ema, eval_model, prdc_eval_model, train_dataloader, eval_dataloader, global_rank, local_rank, mu, sigma, real_feats, logger,
                  aa_p, best_step, best_fid, best_ckpt_path, lecam_emas, num_eval, loss_list_dict, metric_dict_during_train):
         self.cfgs = cfgs
         self.run_name = run_name
@@ -71,6 +71,9 @@ class WORKER(object):
         self.Gen_ema_synthesis = Gen_ema_synthesis
         self.ema = ema
         self.eval_model = eval_model
+        # prdc_eval_model may be a different backbone (e.g. VGG16) while eval_model is CLIP.
+        # When backbones are the same, this is the same object as eval_model.
+        self.prdc_eval_model = prdc_eval_model
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
         self.global_rank = global_rank
@@ -177,11 +180,19 @@ class WORKER(object):
 
         if self.global_rank == 0:
             resume = False if self.RUN.freezeD > -1 else True
-            wandb.init(project=self.RUN.project,
-                       entity=self.RUN.entity,
-                       name=self.run_name,
-                       dir=self.RUN.save_dir,
-                       resume=self.best_step > 0 and resume)
+            # If a wandb_id is provided, prefer resuming that run. Also allow resuming when best_step > 0.
+            resume_flag = (self.best_step > 0 and resume) or (hasattr(self.RUN, 'wandb_id') and self.RUN.wandb_id is not None)
+            init_kwargs = dict(project=self.RUN.project,
+                               entity=self.RUN.entity,
+                               name=self.run_name,
+                               dir=self.RUN.save_dir,
+                               resume=resume_flag)
+            # include optional wandb id and group when provided via CLI
+            if hasattr(self.RUN, 'wandb_id') and self.RUN.wandb_id is not None:
+                init_kwargs['id'] = self.RUN.wandb_id
+            if hasattr(self.RUN, 'wandb_group') and self.RUN.wandb_group is not None:
+                init_kwargs['group'] = self.RUN.wandb_group
+            wandb.init(**init_kwargs)
 
         self.start_time = datetime.now()
 
@@ -816,11 +827,17 @@ class WORKER(object):
             generator, generator_mapping, generator_synthesis = self.gen_ctlr.prepare_generator()
             metric_dict = {}
 
+            num_generate_default = self.num_eval[self.RUN.ref_dataset]
+            eval_num_generate_map = getattr(self.RUN, "eval_num_generate_map", {})
+            num_generate_fid = eval_num_generate_map.get("fid", num_generate_default)
+            num_generate_fid_specific = eval_num_generate_map.get("fid_specific_classes", num_generate_default)
+            num_generate_prdc = eval_num_generate_map.get("prdc", num_generate_default)
+
             fake_feats, fake_probs, fake_labels = features.generate_images_and_stack_features(
                                                                    generator=generator,
                                                                    discriminator=self.Dis,
                                                                    eval_model=self.eval_model,
-                                                                   num_generate=self.num_eval[self.RUN.ref_dataset],
+                                                                   num_generate=num_generate_default,
                                                                    y_sampler="totally_random",
                                                                    batch_size=self.OPTIMIZATION.batch_size,
                                                                    z_prior=self.MODEL.z_prior,
@@ -869,7 +886,7 @@ class WORKER(object):
             if "fid" in metrics:
                 fid_score, m1, c1 = fid.calculate_fid(data_loader=self.eval_dataloader,
                                                       eval_model=self.eval_model,
-                                                      num_generate=self.num_eval[self.RUN.ref_dataset],
+                                                      num_generate=num_generate_fid,
                                                       cfgs=self.cfgs,
                                                       pre_cal_mean=self.mu,
                                                       pre_cal_std=self.sigma,
@@ -887,12 +904,59 @@ class WORKER(object):
                         self.logger.info("Best FID score (Step: {step}, Using {type} moments): {FID}".format(
                             step=self.best_step, type=self.RUN.ref_dataset, FID=self.best_fid))
 
+            if "fid_specific_classes" in metrics:
+                fids_by_class = fid.calculate_fid_specific_classes(data_loader=self.eval_dataloader,
+                                                                   eval_model=self.eval_model,
+                                                                   num_generate=num_generate_fid_specific,
+                                                                   cfgs=self.cfgs,
+                                                                   quantize=True,
+                                                                   fake_feats=fake_feats,
+                                                                   disable_tqdm=self.global_rank != 0)
+                if self.global_rank == 0:
+                    self.logger.info("FID-specific classes (Step: {step}, {num} generated images):".format(
+                        step=step, num=str(num_generate_fid_specific)))
+                    for class_name, class_fid in sorted(fids_by_class.items()):
+                        self.logger.info("  {class_name}: {FID}".format(class_name=class_name, FID=class_fid))
+                    metric_dict.update(fids_by_class)
+                    if writing:
+                        for class_name, class_fid in fids_by_class.items():
+                            wandb.log({f"FID-specific/{class_name}": class_fid}, step=self.wandb_step)
+
             if "prdc" in metrics:
+                # When prdc_eval_model uses a different backbone than eval_model,
+                # we need to generate fake features using the PRDC backbone separately.
+                if self.prdc_eval_model is not self.eval_model:
+                    prdc_fake_feats, _, _ = features.generate_images_and_stack_features(
+                                                                   generator=generator,
+                                                                   discriminator=self.Dis,
+                                                                   eval_model=self.prdc_eval_model,
+                                                                   num_generate=num_generate_prdc,
+                                                                   y_sampler="totally_random",
+                                                                   batch_size=self.OPTIMIZATION.batch_size,
+                                                                   z_prior=self.MODEL.z_prior,
+                                                                   truncation_factor=self.RUN.truncation_factor,
+                                                                   z_dim=self.MODEL.z_dim,
+                                                                   num_classes=self.DATA.num_classes,
+                                                                   LOSS=self.LOSS,
+                                                                   RUN=self.RUN,
+                                                                   MODEL=self.MODEL,
+                                                                   is_stylegan=self.is_stylegan,
+                                                                   generator_mapping=generator_mapping,
+                                                                   generator_synthesis=generator_synthesis,
+                                                                   quantize=True,
+                                                                   world_size=self.OPTIMIZATION.world_size,
+                                                                   DDP=self.DDP,
+                                                                   device=self.local_rank,
+                                                                   logger=self.logger,
+                                                                   disable_tqdm=self.global_rank != 0)
+                else:
+                    prdc_fake_feats = fake_feats
+
                 prc, rec, dns, cvg = prdc.calculate_pr_dc(real_feats=self.real_feats,
-                                                          fake_feats=fake_feats,
+                                                          fake_feats=prdc_fake_feats,
                                                           data_loader=self.eval_dataloader,
-                                                          eval_model=self.eval_model,
-                                                          num_generate=self.num_eval[self.RUN.ref_dataset],
+                                                          eval_model=self.prdc_eval_model,
+                                                          num_generate=num_generate_prdc,
                                                           cfgs=self.cfgs,
                                                           quantize=True,
                                                           nearest_k=nearest_k,

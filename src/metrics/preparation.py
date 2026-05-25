@@ -6,6 +6,7 @@
 
 from os.path import exists, join
 import os
+import pickle
 
 try:
     from torchvision.models.utils import load_state_dict_from_url
@@ -19,6 +20,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import numpy as np
+import torch.nn.modules.linear as nn_linear
+
+# Torchvision compatibility shims for older pickled transforms.
+if not hasattr(transforms.Resize, "max_size"):
+    transforms.Resize.max_size = None
+if not hasattr(transforms.Resize, "antialias"):
+    transforms.Resize.antialias = None
+if not hasattr(nn.MultiheadAttention, "batch_first"):
+    nn.MultiheadAttention.batch_first = False
 
 from metrics.inception_net import InceptionV3
 from metrics.swin_transformer import SwinTransformer
@@ -33,6 +43,7 @@ import utils.resize as resize
 model_versions = {"InceptionV3_torch": "pytorch/vision:v0.10.0",
                   "ResNet_torch": "pytorch/vision:v0.10.0",
                   "SwAV_torch": "facebookresearch/swav:main"}
+VGG16_URL = "https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan2_ada/versions/1/files/vgg16.pt"  # reference only
 model_names = {"InceptionV3_torch": "inception_v3",
                "ResNet50_torch": "resnet50",
                "SwAV_torch": "resnet50"}
@@ -41,7 +52,8 @@ SWIN_URL = "https://github.com/SwinTransformer/storage/releases/download/v1.0.0/
 
 
 class LoadEvalModel(object):
-    def __init__(self, eval_backbone, post_resizer, world_size, distributed_data_parallel, device):
+    def __init__(self, eval_backbone, post_resizer, world_size, distributed_data_parallel, device,
+                 clip_pkl_path=None, vgg16_pkl_path=None, inception_pth_path=None):
         super(LoadEvalModel, self).__init__()
         self.eval_backbone = eval_backbone
         self.post_resizer = post_resizer
@@ -50,7 +62,9 @@ class LoadEvalModel(object):
 
         if self.eval_backbone == "InceptionV3_tf":
             self.res, mean, std = 299, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
-            self.model = InceptionV3(resize_input=False, normalize_input=False).to(self.device)
+            self.model = InceptionV3(resize_input=False,
+                                     normalize_input=False,
+                                     inception_pth_path=inception_pth_path).to(self.device)
         elif self.eval_backbone in ["InceptionV3_torch", "ResNet50_torch", "SwAV_torch"]:
             self.res = 299 if "InceptionV3" in self.eval_backbone else 224
             mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
@@ -79,6 +93,36 @@ class LoadEvalModel(object):
             model_state_dict = load_state_dict_from_url(SWIN_URL, progress=True)["model"]
             self.model.load_state_dict(model_state_dict, strict=True)
             self.model = self.model.to(self.device)
+        elif self.eval_backbone == "CLIP_torch":
+            # Loads a self-contained CLIP visual encoder pkl (no 'clip' package required).
+            # The pkl model handles its own resizing and normalisation internally;
+            # it expects uint8 images in [0, 255] and returns L2-normalised embeddings.
+            # Compatible with the clip-vit_b32.pkl format from Unconditional-Training-CGANs.
+            assert clip_pkl_path is not None, \
+                "Please supply --clip_pkl_path pointing to clip-vit_b32.pkl (or equivalent)."
+            assert exists(clip_pkl_path), \
+                f"CLIP pkl not found at: {clip_pkl_path}"
+            if not hasattr(nn_linear, "_LinearWithBias"):
+                # Unpickle compatibility for older CLIP pickles.
+                nn_linear._LinearWithBias = nn.Linear
+            self.res, mean, std = 224, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]  # unused; model preprocesses internally
+            with open(clip_pkl_path, "rb") as f:
+                self.model = pickle.load(f).eval().to(self.device)
+            self._patch_torchvision_transforms()
+        elif self.eval_backbone == "VGG16_torch":
+            # Loads a self-contained VGG16 TorchScript model (no extra package required).
+            # The model handles its own resizing and normalisation internally;
+            # it expects uint8 images in [0, 255]. Call with return_features=True to get
+            # feature vectors (2048-d) instead of class logits.
+            # Compatible with the vgg16.pt format from Unconditional-Training-CGANs /
+            # StyleGAN2-ADA (https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan2_ada).
+            assert vgg16_pkl_path is not None, \
+                "Please supply --vgg16_pkl_path pointing to vgg16.pt (or equivalent)."
+            assert exists(vgg16_pkl_path), \
+                f"VGG16 model not found at: {vgg16_pkl_path}"
+            self.res, mean, std = 224, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]  # unused; model preprocesses internally
+            with open(vgg16_pkl_path, "rb") as f:
+                self.model = torch.jit.load(f).eval().to(self.device)
         else:
             raise NotImplementedError
 
@@ -100,7 +144,51 @@ class LoadEvalModel(object):
     def eval(self):
         self.model.eval()
 
+    def _patch_torchvision_transforms(self):
+        # Some pickles store torchvision transform objects without newer attributes.
+        try:
+            default_interp = transforms.InterpolationMode.BILINEAR
+        except AttributeError:
+            default_interp = 2  # BILINEAR
+
+        for module in self.model.modules():
+            if isinstance(module, transforms.Resize):
+                if not hasattr(module, "max_size"):
+                    module.max_size = None
+                if not hasattr(module, "antialias"):
+                    module.antialias = None
+                if not hasattr(module, "interpolation"):
+                    module.interpolation = default_interp
+            elif isinstance(module, transforms.RandomResizedCrop):
+                if not hasattr(module, "antialias"):
+                    module.antialias = None
+                if not hasattr(module, "interpolation"):
+                    module.interpolation = default_interp
+            elif isinstance(module, (transforms.CenterCrop, transforms.RandomCrop)):
+                if not hasattr(module, "interpolation"):
+                    module.interpolation = default_interp
+
     def get_outputs(self, x, quantize=False):
+        if self.eval_backbone in ("CLIP_torch", "VGG16_torch"):
+            # These self-contained pkl/pt models handle their own preprocessing;
+            # feed raw uint8 images directly (no external normalisation).
+            if quantize:
+                x_uint8 = ops.quantize_images(x)           # returns uint8 numpy array
+                if isinstance(x_uint8, np.ndarray):
+                    x_uint8 = torch.from_numpy(x_uint8)
+            else:
+                x_uint8 = x.clamp(0, 255).to(torch.uint8)  # already on GPU
+            x_uint8 = x_uint8.to(self.device)
+            with torch.no_grad():
+                if self.eval_backbone == "CLIP_torch":
+                    repres = self.model(x_uint8)
+                else:  # VGG16_torch — call with return_features=True to get feature vectors
+                    repres = self.model(x_uint8, return_features=True)
+            # Return a dummy logits tensor so callers expecting (repres, logits) work.
+            # IS is meaningless with CLIP/VGG16; FID/PRDC only consume repres.
+            dummy_logits = torch.zeros(repres.shape[0], 1000, device=self.device)
+            return repres, dummy_logits
+
         if quantize:
             x = ops.quantize_images(x)
         else:

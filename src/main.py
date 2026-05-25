@@ -29,6 +29,8 @@ def load_configs_initialize_training():
     parser = ArgumentParser(add_help=True)
     parser.add_argument("--entity", type=str, default=None, help="entity for wandb logging")
     parser.add_argument("--project", type=str, default=None, help="project name for wandb logging")
+    parser.add_argument("--wandb_id", type=str, default=None, help="existing wandb run id to resume")
+    parser.add_argument("--wandb_group", type=str, default=None, help="wandb group name for the run")
 
     parser.add_argument("-cfg", "--cfg_file", type=str, default="./src/configs/CIFAR10/ContraGAN.yaml")
     parser.add_argument("-data", "--data_dir", type=str, default=None)
@@ -76,7 +78,7 @@ def load_configs_initialize_training():
     parser.add_argument("-hdf5", "--load_train_hdf5", action="store_true", help="load train images from a hdf5 file for fast I/O")
     parser.add_argument("-l", "--load_data_in_memory", action="store_true", help="put the whole train dataset on the main memory for fast I/O")
     parser.add_argument("-metrics", "--eval_metrics", nargs='+', default=['fid'],
-                        help="evaluation metrics to use during training, a subset list of ['fid', 'is', 'prdc'] or none")
+                        help="evaluation metrics to use during training, a subset list of ['fid', 'fid_specific_classes', 'prdc', 'is', 'none'] or aliases ['fidclip50k_full', 'prdc50k_full']")
     parser.add_argument("--pre_resizer", type=str, default="wo_resize", help="which resizer will you use to pre-process images\
                         in ['wo_resize', 'nearest', 'bilinear', 'bicubic', 'lanczos']")
     parser.add_argument("--post_resizer", type=str, default="legacy", help="which resizer will you use to evaluate GANs\
@@ -104,7 +106,25 @@ def load_configs_initialize_training():
     parser.add_argument("--print_freq", type=int, default=100, help="logging interval")
     parser.add_argument("--save_freq", type=int, default=2000, help="save interval")
     parser.add_argument('--eval_backbone', type=str, default='InceptionV3_tf',\
-                        help="[InceptionV3_tf, InceptionV3_torch, ResNet50_torch, SwAV_torch, DINO_torch, Swin-T_torch]")
+                        help="[InceptionV3_tf, InceptionV3_torch, ResNet50_torch, SwAV_torch, DINO_torch, Swin-T_torch, CLIP_torch]")
+    parser.add_argument('--clip_pkl_path', type=str, default='./models/clip-vit_b32.pkl',
+                        help="path to a self-contained CLIP visual encoder pkl (no 'clip' package required). "
+                             "Only used when --eval_backbone CLIP_torch. Compatible with the "
+                             "clip-vit_b32.pkl format from Unconditional-Training-CGANs.")
+    parser.add_argument('--inception_pth_path', type=str, default=None,
+                        help="path to the FID InceptionV3 weights (.pth). "
+                             "Used when --eval_backbone InceptionV3_tf to avoid network downloads.")
+    parser.add_argument('--prdc_backbone', type=str, default='N/A',
+                        help="backbone to use specifically for PRDC. When 'N/A' (default), the main "
+                             "--eval_backbone is used for all metrics. Set to 'VGG16_torch' to exactly "
+                             "match the prdc50k_full metric from Unconditional-Training-CGANs. "
+                             "[N/A, InceptionV3_tf, InceptionV3_torch, ResNet50_torch, SwAV_torch, "
+                             "DINO_torch, Swin-T_torch, CLIP_torch, VGG16_torch]")
+    parser.add_argument('--vgg16_pkl_path', type=str, default='./models/vgg16.pt',
+                        help="path to a VGG16 TorchScript model file (.pt). "
+                             "Only used when --prdc_backbone VGG16_torch. "
+                             "Compatible with the vgg16.pt format from StyleGAN2-ADA / "
+                             "Unconditional-Training-CGANs.")
     parser.add_argument("-ref", "--ref_dataset", type=str, default="train", help="reference dataset for evaluation[train/valid/test]")
     parser.add_argument("--calc_is_ref_dataset", action="store_true", help="whether to calculate a inception score of the ref dataset.")
     args = parser.parse_args()

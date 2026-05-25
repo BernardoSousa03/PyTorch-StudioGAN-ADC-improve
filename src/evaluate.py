@@ -78,7 +78,16 @@ def prepare_evaluation():
     parser.add_argument("--post_resizer", type=str, default="legacy", help="which resizer will you use to evaluate GANs\
                         in ['legacy', 'clean', 'friendly']")
     parser.add_argument('--eval_backbone', type=str, default='InceptionV3_tf',\
-                        help="[InceptionV3_tf, InceptionV3_torch, ResNet50_torch, SwAV_torch, DINO_torch, Swin-T_torch]")
+                        help="[InceptionV3_tf, InceptionV3_torch, ResNet50_torch, SwAV_torch, DINO_torch, Swin-T_torch, CLIP_torch]")
+    parser.add_argument('--clip_pkl_path', type=str, default='./models/clip-vit_b32.pkl',
+                        help="path to a self-contained CLIP visual encoder pkl (no 'clip' package required). "
+                             "Only used when --eval_backbone CLIP_torch.")
+    parser.add_argument('--prdc_backbone', type=str, default='N/A',
+                        help="backbone for PRDC specifically. 'N/A' = use --eval_backbone for all metrics. "
+                             "[N/A, InceptionV3_tf, InceptionV3_torch, ResNet50_torch, SwAV_torch, "
+                             "DINO_torch, Swin-T_torch, CLIP_torch, VGG16_torch]")
+    parser.add_argument('--vgg16_pkl_path', type=str, default='./models/vgg16.pt',
+                        help="path to VGG16 TorchScript model (.pt). Only used when --prdc_backbone VGG16_torch.")
     parser.add_argument("--dset1", type=str, default=None, help="specify the directory of the folder that contains dset1 images (real).")
     parser.add_argument("--dset1_feats", type=str, default=None, help="specify the path of *.npy that contains features of dset1 (real). \
                         If not specified, StudioGAN will automatically extract feat1 using the whole dset1.")
@@ -190,7 +199,21 @@ def evaluate(local_rank, args, world_size, gpus_per_node):
                                   post_resizer=args.post_resizer,
                                   world_size=world_size,
                                   distributed_data_parallel=args.distributed_data_parallel,
-                                  device=local_rank)
+                                  device=local_rank,
+                                  clip_pkl_path=args.clip_pkl_path,
+                                  vgg16_pkl_path=args.vgg16_pkl_path)
+
+    _prdc_bb = args.prdc_backbone
+    if _prdc_bb == "N/A" or _prdc_bb == args.eval_backbone:
+        prdc_eval_model = eval_model
+    else:
+        prdc_eval_model = pp.LoadEvalModel(eval_backbone=_prdc_bb,
+                                           post_resizer=args.post_resizer,
+                                           world_size=world_size,
+                                           distributed_data_parallel=args.distributed_data_parallel,
+                                           device=local_rank,
+                                           clip_pkl_path=args.clip_pkl_path,
+                                           vgg16_pkl_path=args.vgg16_pkl_path)
 
     # -----------------------------------------------------------------------------
     # extract features, probabilities, and labels to calculate metrics.
@@ -215,6 +238,32 @@ def evaluate(local_rank, args, world_size, gpus_per_node):
                                       DDP=args.distributed_data_parallel,
                                       device=local_rank,
                                       disable_tqdm=local_rank != 0)
+
+    # When prdc_backbone differs from eval_backbone, extract separate features for PRDC.
+    if "prdc" in args.eval_metrics and prdc_eval_model is not eval_model:
+        if load_dset1:
+            prdc_dset1_feats, _, _ = features.sample_images_from_loader_and_stack_features(
+                                              dataloader=dset1_dataloader,
+                                              eval_model=prdc_eval_model,
+                                              batch_size=batch_size,
+                                              quantize=False,
+                                              world_size=world_size,
+                                              DDP=args.distributed_data_parallel,
+                                              device=local_rank,
+                                              disable_tqdm=local_rank != 0)
+        prdc_dset2_feats, _, _ = features.sample_images_from_loader_and_stack_features(
+                                          dataloader=dset2_dataloader,
+                                          eval_model=prdc_eval_model,
+                                          batch_size=batch_size,
+                                          quantize=False,
+                                          world_size=world_size,
+                                          DDP=args.distributed_data_parallel,
+                                          device=local_rank,
+                                          disable_tqdm=local_rank != 0)
+    else:
+        # Same backbone — reuse the already-extracted features.
+        prdc_dset1_feats = dset1_feats if load_dset1 else None
+        prdc_dset2_feats = dset2_feats
 
     # -----------------------------------------------------------------------------
     # calculate metrics.
@@ -268,12 +317,12 @@ def evaluate(local_rank, args, world_size, gpus_per_node):
     if "prdc" in args.eval_metrics:
         nearest_k = 5
         if args.dset1_feats is None:
-            dset1_feats_np = np.array(dset1_feats.detach().cpu().numpy(), dtype=np.float64)[:len(dset1)]
+            dset1_feats_np = np.array(prdc_dset1_feats.detach().cpu().numpy(), dtype=np.float64)[:len(dset1)]
             dset1_mode = "dset1"
         else:
             dset1_feats_np = np.load(args.dset1_feats, mmap_mode='r')["real_feats"]
             dset1_mode = "pre-calculated dset1_feats"
-        dset2_feats_np = np.array(dset2_feats.detach().cpu().numpy(), dtype=np.float64)[:len(dset2)]
+        dset2_feats_np = np.array(prdc_dset2_feats.detach().cpu().numpy(), dtype=np.float64)[:len(dset2)]
         metrics = prdc.compute_prdc(real_features=dset1_feats_np, fake_features=dset2_feats_np, nearest_k=nearest_k)
         prc, rec, dns, cvg = metrics["precision"], metrics["recall"], metrics["density"], metrics["coverage"]
         if local_rank == 0:

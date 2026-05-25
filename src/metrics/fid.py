@@ -134,3 +134,99 @@ def calculate_fid(data_loader,
 
     fid_value = frechet_inception_distance(m1, s1, m2, s2)
     return fid_value, m1, s1
+
+
+def calculate_fid_specific_classes(data_loader,
+                                   eval_model,
+                                   num_generate,
+                                   cfgs,
+                                   quantize=True,
+                                   fake_feats=None,
+                                   disable_tqdm=False):
+    """Computes the FID separately for specific classes. By default, this corresponds
+    to 5 head, 5 middle, and 10 tail classes. Useful when there is a large
+    number of classes and tracking the FID for all of them during training
+    is too expensive.
+    
+    Args:
+        data_loader: DataLoader for real images with labels
+        eval_model: Evaluation model (e.g., InceptionV3)
+        num_generate: Number of generated samples per class
+        cfgs: Configuration object
+        quantize: Whether to quantize features
+        fake_feats: Pre-computed fake features (optional)
+        disable_tqdm: Disable progress bar
+        
+    Returns:
+        fids_by_class: Dictionary with FID scores for each specific class
+    """
+    eval_model.eval()
+    
+    # Get interesting classes (head, middle, tail)
+    try:
+        # Try to get interesting classes if the dataset supports it
+        interesting_classes = data_loader.dataset.get_interesting_classes()
+    except (AttributeError, NotImplementedError):
+        # Fall back to all classes
+        if hasattr(data_loader.dataset, 'classes'):
+            interesting_classes = list(range(len(data_loader.dataset.classes)))
+        else:
+            interesting_classes = list(range(getattr(data_loader.dataset, 'num_classes', 10)))
+    
+    n_digits = len(str(max(interesting_classes) if interesting_classes else 0))
+    fids_by_class = {}
+    
+    for class_idx in interesting_classes:
+        # Filter data loader for this class
+        # Create a subset dataset with only this class
+        class_dataset = data_loader.dataset
+        if hasattr(class_dataset, 'filter_by_class'):
+            class_subset = class_dataset.filter_by_class(class_idx)
+        else:
+            # Fallback: manually filter based on labels
+            indices = [i for i, (_, label) in enumerate(class_dataset) if label == class_idx]
+            if not indices:
+                continue
+            class_subset = torch.utils.data.Subset(class_dataset, indices)
+        
+        class_data_loader = torch.utils.data.DataLoader(
+            class_subset,
+            batch_size=cfgs.OPTIMIZATION.batch_size,
+            shuffle=False,
+            num_workers=data_loader.num_workers
+        )
+        
+        # Calculate moments for this class
+        m1, s1 = calculate_moments(
+            data_loader=class_data_loader,
+            eval_model=eval_model,
+            num_generate="N/A",
+            batch_size=cfgs.OPTIMIZATION.batch_size,
+            quantize=quantize,
+            world_size=cfgs.OPTIMIZATION.world_size,
+            DDP=cfgs.RUN.distributed_data_parallel,
+            disable_tqdm=disable_tqdm,
+            fake_feats=None
+        )
+        
+        # For generated features, we need class-conditioned generation
+        # This requires the generator to support class conditioning
+        # For now, we use the overall generated features
+        # TODO: Implement class-conditional generation
+        m2, s2 = calculate_moments(
+            data_loader="N/A",
+            eval_model=eval_model,
+            num_generate=num_generate,
+            batch_size=cfgs.OPTIMIZATION.batch_size,
+            quantize=quantize,
+            world_size=cfgs.OPTIMIZATION.world_size,
+            DDP=cfgs.RUN.distributed_data_parallel,
+            disable_tqdm=disable_tqdm,
+            fake_feats=fake_feats
+        )
+        
+        # Compute FID for this class
+        fid_value = frechet_inception_distance(m1, s1, m2, s2)
+        fids_by_class[f"class_{str(class_idx).zfill(n_digits)}"] = fid_value
+    
+    return fids_by_class

@@ -77,6 +77,7 @@ class Dataset_(Dataset):
         self.hdf5_path = hdf5_path
         self.load_data_in_memory = load_data_in_memory
         self.trsf_list = []
+        self._labels_cache = None
 
         if self.hdf5_path is None:
             if crop_long_edge:
@@ -123,6 +124,52 @@ class Dataset_(Dataset):
     def _get_hdf5(self, index):
         with h5.File(self.hdf5_path, "r") as f:
             return f["imgs"][index], f["labels"][index]
+
+    def _get_labels(self):
+        if self._labels_cache is not None:
+            return self._labels_cache
+
+        if self.hdf5_path is None:
+            if hasattr(self.data, "targets"):
+                labels = self.data.targets
+            elif hasattr(self.data, "labels"):
+                labels = self.data.labels
+            else:
+                labels = []
+        else:
+            if self.load_data_in_memory:
+                labels = self.labels
+            else:
+                with h5.File(self.hdf5_path, "r") as f:
+                    labels = f["labels"][:]
+
+        labels = np.asarray(labels, dtype=np.int64)
+        self._labels_cache = labels
+        return labels
+
+    def get_label_counts(self, sort=False, reverse=True):
+        labels = self._get_labels()
+        if labels.size == 0:
+            return {}
+
+        unique, counts = np.unique(labels, return_counts=True)
+        label_counts = {int(label): int(count) for label, count in zip(unique, counts)}
+        if sort:
+            label_counts = {label: count for label, count in
+                sorted(label_counts.items(), key=lambda item: item[1], reverse=reverse)}
+        return label_counts
+
+    def get_interesting_classes(self, head_classes_first=True, max_n_classes=20):
+        # Mirrors Unconditional-Training-CGANs: 5 head, 5 middle, 10 tail.
+        label_counts = self.get_label_counts(sort=True, reverse=head_classes_first)
+        n_classes = len(label_counts)
+        labels = list(label_counts.keys())
+
+        if n_classes > max_n_classes:
+            middle = min(n_classes // 2, n_classes - 13)
+            selected = labels[:5] + labels[middle-2:middle+3] + labels[-10:]
+            return selected
+        return labels
 
     def __len__(self):
         if self.hdf5_path is None:
