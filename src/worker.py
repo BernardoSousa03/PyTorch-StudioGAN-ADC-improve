@@ -59,7 +59,8 @@ LOG_FORMAT = ("Step: {step:>6} "
 class WORKER(object):
     def __init__(self, cfgs, run_name, Gen, Gen_mapping, Gen_synthesis, Dis, Gen_ema, Gen_ema_mapping, Gen_ema_synthesis,
                  ema, eval_model, prdc_eval_model, train_dataloader, eval_dataloader, global_rank, local_rank, mu, sigma, real_feats, logger,
-                 aa_p, best_step, best_fid, best_ckpt_path, lecam_emas, num_eval, loss_list_dict, metric_dict_during_train):
+                 aa_p, best_step, best_fid, best_ckpt_path, lecam_emas, num_eval, loss_list_dict, metric_dict_during_train,
+                 metric_specs=None, eval_models_map=None, moments_map=None):
         self.cfgs = cfgs
         self.run_name = run_name
         self.Gen = Gen
@@ -91,6 +92,27 @@ class WORKER(object):
         self.loss_list_dict = loss_list_dict
         self.metric_dict_during_train = metric_dict_during_train
         self.metric_dict_during_final_eval = {}
+        # metric_specs: list of dicts like {'metric':'fid'/'ifid'/'prdc','backbone':'CLIP_torch', 'num_generate':50000, 'alias': 'fidclip50k_full'}
+        self.metric_specs = metric_specs or []
+        self.eval_models_map = eval_models_map or {self.RUN.eval_backbone: self.eval_model}
+        self.moments_map = moments_map or {}
+
+    def _metric_backbone_label(self, backbone):
+        labels = {
+            "InceptionV3_tf": "Inception",
+            "InceptionV3_torch": "Inception",
+            "ResNet50_torch": "ResNet50",
+            "SwAV_torch": "SwAV",
+            "DINO_torch": "DINO",
+            "Swin-T_torch": "SwinT",
+            "CLIP_torch": "CLIP",
+            "VGG16_torch": "VGG16",
+        }
+        return labels.get(backbone, backbone)
+
+    def _metric_namespace(self, metric_name, backbone, num_generate):
+        backbone_label = self._metric_backbone_label(backbone)
+        return f"{metric_name.upper()}/{backbone_label}/{num_generate}"
 
         self.cfgs.define_augments(local_rank)
         self.cfgs.define_losses()
@@ -826,12 +848,171 @@ class WORKER(object):
             misc.make_GAN_untrainable(self.Gen, self.Gen_ema, self.Dis)
             generator, generator_mapping, generator_synthesis = self.gen_ctlr.prepare_generator()
             metric_dict = {}
+            fake_bundle_cache = {}
 
+            def get_fake_bundle(backbone, num_generate):
+                cache_key = (backbone, num_generate)
+                if cache_key not in fake_bundle_cache:
+                    eval_model_bb = self.eval_models_map.get(backbone, self.eval_model)
+                    fake_bundle_cache[cache_key] = features.generate_images_and_stack_features(
+                        generator=generator,
+                        discriminator=self.Dis,
+                        eval_model=eval_model_bb,
+                        num_generate=num_generate,
+                        y_sampler="totally_random",
+                        batch_size=self.OPTIMIZATION.batch_size,
+                        z_prior=self.MODEL.z_prior,
+                        truncation_factor=self.RUN.truncation_factor,
+                        z_dim=self.MODEL.z_dim,
+                        num_classes=self.DATA.num_classes,
+                        LOSS=self.LOSS,
+                        RUN=self.RUN,
+                        MODEL=self.MODEL,
+                        is_stylegan=self.is_stylegan,
+                        generator_mapping=generator_mapping,
+                        generator_synthesis=generator_synthesis,
+                        quantize=True,
+                        world_size=self.OPTIMIZATION.world_size,
+                        DDP=self.DDP,
+                        device=self.local_rank,
+                        logger=self.logger,
+                        disable_tqdm=self.global_rank != 0,
+                    )
+                return fake_bundle_cache[cache_key]
+
+            # If metric_specs is present, iterate those; otherwise fall back to legacy behaviour
             num_generate_default = self.num_eval[self.RUN.ref_dataset]
             eval_num_generate_map = getattr(self.RUN, "eval_num_generate_map", {})
             num_generate_fid = eval_num_generate_map.get("fid", num_generate_default)
             num_generate_fid_specific = eval_num_generate_map.get("fid_specific_classes", num_generate_default)
             num_generate_prdc = eval_num_generate_map.get("prdc", num_generate_default)
+
+            if self.metric_specs:
+                # compute each requested metric variant
+                for spec in self.metric_specs:
+                    metric = spec['metric']
+                    backbone = spec.get('backbone', self.RUN.eval_backbone)
+                    num_generate = spec.get('num_generate', num_generate_default)
+                    alias = spec.get('alias', None)
+
+                    if metric == 'is':
+                        # reuse existing IS code path (single backbone)
+                        kl_score, kl_std, top1, top5 = ins.eval_features(probs=fake_probs,
+                                                                         labels=fake_labels,
+                                                                         data_loader=self.eval_dataloader,
+                                                                         num_features=self.num_eval[self.RUN.ref_dataset],
+                                                                         split=num_splits,
+                                                                         is_acc=is_acc,
+                                                                         is_torch_backbone=True if "torch" in self.RUN.eval_backbone else False)
+                        if self.global_rank == 0:
+                            self.logger.info("Inception score (Step: {step}, {num} generated images): {IS}".format(
+                                step=step, num=str(self.num_eval[self.RUN.ref_dataset]), IS=kl_score))
+                            metric_dict.update({"IS": kl_score, "Top1_acc": top1, "Top5_acc": top5})
+                            if writing:
+                                wandb.log({"IS score": kl_score}, step=self.wandb_step)
+
+                    elif metric == 'fid':
+                        # use backbone-specific eval_model and moments
+                        eval_model_bb = self.eval_models_map.get(backbone, self.eval_model)
+                        mu_bb, sigma_bb = None, None
+                        if backbone in self.moments_map:
+                            mu_bb, sigma_bb = self.moments_map[backbone]['mu'], self.moments_map[backbone]['sigma']
+                        fake_feats_bb, _, _ = get_fake_bundle(backbone, num_generate)
+                        fid_score, m1, c1 = fid.calculate_fid(data_loader=self.eval_dataloader,
+                                                              eval_model=eval_model_bb,
+                                                              num_generate=num_generate,
+                                                              cfgs=self.cfgs,
+                                                              pre_cal_mean=mu_bb if mu_bb is not None else self.mu,
+                                                              pre_cal_std=sigma_bb if sigma_bb is not None else self.sigma,
+                                                              fake_feats=fake_feats_bb,
+                                                              disable_tqdm=self.global_rank != 0)
+                        if self.global_rank == 0:
+                            display_name = self._metric_namespace("fid", backbone, num_generate)
+                            self.logger.info(f"{display_name} (Step: {step}, Using {backbone} moments): {fid_score}")
+                            metric_dict.update({display_name: fid_score})
+                            if writing:
+                                wandb.log({display_name: fid_score}, step=self.wandb_step)
+
+                    elif metric == 'fid_specific_classes':
+                        # keep legacy behaviour, per-class FID specific classes
+                        eval_model_bb = self.eval_models_map.get(backbone, self.eval_model)
+                        fake_feats_bb, _, _ = get_fake_bundle(backbone, num_generate)
+                        fids_by_class = fid.calculate_fid_specific_classes(data_loader=self.eval_dataloader,
+                                                                           eval_model=eval_model_bb,
+                                                                           num_generate=num_generate,
+                                                                           cfgs=self.cfgs,
+                                                                           quantize=True,
+                                                                           fake_feats=fake_feats_bb,
+                                                                           disable_tqdm=self.global_rank != 0)
+                        if self.global_rank == 0:
+                            display_prefix = self._metric_namespace("fid-specific", backbone, num_generate)
+                            for class_name, class_fid in fids_by_class.items():
+                                metric_key = f"{display_prefix}/{class_name}"
+                                metric_dict.update({metric_key: class_fid})
+                                if writing:
+                                    wandb.log({metric_key: class_fid}, step=self.wandb_step)
+
+                    elif metric == 'prdc':
+                        prdc_fake_feats, _, _ = get_fake_bundle(backbone, num_generate)
+                        # If PRDC backbone differs from the backbone used to create fake_feats,
+                        # generate PRDC features separately using the prdc_eval_model
+                        if self.prdc_eval_model is not self.eval_models_map.get(backbone, self.eval_model):
+                            prdc_fake_feats, _, _ = features.generate_images_and_stack_features(
+                                                                   generator=generator,
+                                                                   discriminator=self.Dis,
+                                                                   eval_model=self.prdc_eval_model,
+                                                                   num_generate=num_generate,
+                                                                   y_sampler="totally_random",
+                                                                   batch_size=self.OPTIMIZATION.batch_size,
+                                                                   z_prior=self.MODEL.z_prior,
+                                                                   truncation_factor=self.RUN.truncation_factor,
+                                                                   z_dim=self.MODEL.z_dim,
+                                                                   num_classes=self.DATA.num_classes,
+                                                                   LOSS=self.LOSS,
+                                                                   RUN=self.RUN,
+                                                                   MODEL=self.MODEL,
+                                                                   is_stylegan=self.is_stylegan,
+                                                                   generator_mapping=generator_mapping,
+                                                                   generator_synthesis=generator_synthesis,
+                                                                   quantize=True,
+                                                                   world_size=self.OPTIMIZATION.world_size,
+                                                                   DDP=self.DDP,
+                                                                   device=self.local_rank,
+                                                                   logger=self.logger,
+                                                                   disable_tqdm=self.global_rank != 0)
+                        prc, rec, dns, cvg = prdc.calculate_pr_dc(real_feats=self.real_feats,
+                                                                  fake_feats=prdc_fake_feats,
+                                                                  data_loader=self.eval_dataloader,
+                                                                  eval_model=self.prdc_eval_model,
+                                                                  num_generate=num_generate,
+                                                                  cfgs=self.cfgs,
+                                                                  quantize=True,
+                                                                  nearest_k=nearest_k,
+                                                                  world_size=self.OPTIMIZATION.world_size,
+                                                                  DDP=self.DDP,
+                                                                  disable_tqdm=True)
+                        if self.global_rank == 0:
+                            display_name = self._metric_namespace("prdc", self.RUN.prdc_backbone, num_generate)
+                            metric_dict.update({f"Improved_Precision": prc, "Improved_Recall": rec, "Density": dns, "Coverage": cvg})
+                            if writing:
+                                wandb.log({f"Improved Precision": prc}, step=self.wandb_step)
+                                wandb.log({f"Improved Recall": rec}, step=self.wandb_step)
+                                wandb.log({f"Density": dns}, step=self.wandb_step)
+                                wandb.log({f"Coverage": cvg}, step=self.wandb_step)
+
+                    elif metric == 'ifid':
+                        # compute intra-class FID per-spec using a helper that accepts backbone and per-class sample cap
+                        num_per_class = spec.get('num_generate', None)
+                        prefix = self._metric_namespace("ifid", backbone, num_per_class)
+                        self.calculate_intra_class_fid_variant(dataset=self.eval_dataloader.dataset,
+                                                                eval_model=self.eval_models_map.get(backbone, self.eval_model),
+                                                                num_per_class=num_per_class,
+                                                                prefix=prefix,
+                                                                writing=writing)
+
+                # end for metric_specs
+                # After all specs, return metric_dict for consolidated reporting
+                return metric_dict
 
             fake_feats, fake_probs, fake_labels = features.generate_images_and_stack_features(
                                                                    generator=generator,
@@ -920,7 +1101,7 @@ class WORKER(object):
                     metric_dict.update(fids_by_class)
                     if writing:
                         for class_name, class_fid in fids_by_class.items():
-                            wandb.log({f"FID-specific/{class_name}": class_fid}, step=self.wandb_step)
+                            wandb.log({f"FID-SPECIFIC/CLIP/{num_generate_fid_specific}/{class_name}": class_fid}, step=self.wandb_step)
 
             if "prdc" in metrics:
                 # When prdc_eval_model uses a different backbone than eval_model,
@@ -1512,6 +1693,9 @@ class WORKER(object):
 
                 fids.append(ifid_score)
 
+                if self.global_rank == 0 and wandb.run is not None:
+                    wandb.log({f"iFID/class_{c}": ifid_score}, step=getattr(self, "wandb_step", None))
+
                 # save iFID values in .npz format
                 metric_dict = {"iFID": ifid_score}
 
@@ -1525,6 +1709,105 @@ class WORKER(object):
 
         if self.global_rank == 0 and self.logger:
             self.logger.info("Average iFID score: {iFID}".format(iFID=sum(fids, 0.0) / len(fids)))
+
+        if self.global_rank == 0 and wandb.run is not None and fids:
+            wandb.log({"iFID/avg": sum(fids, 0.0) / len(fids)}, step=getattr(self, "wandb_step", None))
+
+        misc.make_GAN_trainable(self.Gen, self.Gen_ema, self.Dis)
+
+    def calculate_intra_class_fid_variant(self, dataset, eval_model, num_per_class=None, prefix="iFID", writing=True):
+        """Calculate iFID using a specified eval_model and optional per-class sample cap.
+        Logs per-class scores as `{prefix}/class_{c}` and average as `{prefix}/avg` in wandb.
+        """
+        if self.global_rank == 0:
+            self.logger.info("Start calculating iFID variant (use approx. {num} fake images per class).".format(num=str(num_per_class)))
+
+        if self.gen_ctlr.standing_statistics:
+            self.gen_ctlr.std_stat_counter += 1
+
+        fids = []
+        requires_grad = self.LOSS.apply_lo or self.RUN.langevin_sampling
+        with torch.no_grad() if not requires_grad else misc.dummy_context_mgr() as ctx:
+            misc.make_GAN_untrainable(self.Gen, self.Gen_ema, self.Dis)
+            generator, generator_mapping, generator_synthesis = self.gen_ctlr.prepare_generator()
+
+            for c in tqdm(range(self.DATA.num_classes)):
+                num_samples, target_sampler = sample.make_target_cls_sampler(dataset, c)
+                if num_per_class is not None:
+                    num_samples = min(num_samples, int(num_per_class))
+                batch_size = self.OPTIMIZATION.batch_size if num_samples >= self.OPTIMIZATION.batch_size else num_samples
+                dataloader = torch.utils.data.DataLoader(dataset,
+                                                         batch_size=batch_size,
+                                                         shuffle=False,
+                                                         sampler=target_sampler,
+                                                         num_workers=self.RUN.num_workers,
+                                                         pin_memory=True,
+                                                         drop_last=False)
+
+                mu, sigma = fid.calculate_moments(data_loader=dataloader,
+                                                  eval_model=eval_model,
+                                                  num_generate="N/A",
+                                                  batch_size=batch_size,
+                                                  quantize=True,
+                                                  world_size=self.OPTIMIZATION.world_size,
+                                                  DDP=self.DDP,
+                                                  disable_tqdm=True,
+                                                  fake_feats=None)
+
+                c_fake_feats, _,_ = features.generate_images_and_stack_features(
+                                                    generator=generator,
+                                                    discriminator=self.Dis,
+                                                    eval_model=eval_model,
+                                                    num_generate=num_samples,
+                                                    y_sampler=c,
+                                                    batch_size=self.OPTIMIZATION.batch_size,
+                                                    z_prior=self.MODEL.z_prior,
+                                                    truncation_factor=self.RUN.truncation_factor,
+                                                    z_dim=self.MODEL.z_dim,
+                                                    num_classes=self.DATA.num_classes,
+                                                    LOSS=self.LOSS,
+                                                    RUN=self.RUN,
+                                                    MODEL=self.MODEL,
+                                                    is_stylegan=self.is_stylegan,
+                                                    generator_mapping=generator_mapping,
+                                                    generator_synthesis=generator_synthesis,
+                                                    quantize=True,
+                                                    world_size=self.OPTIMIZATION.world_size,
+                                                    DDP=self.DDP,
+                                                    device=self.local_rank,
+                                                    logger=self.logger,
+                                                    disable_tqdm=True)
+
+                ifid_score, _, _ = fid.calculate_fid(data_loader="N/A",
+                                                     eval_model=eval_model,
+                                                     num_generate=num_samples,
+                                                     cfgs=self.cfgs,
+                                                     pre_cal_mean=mu,
+                                                     pre_cal_std=sigma,
+                                                     quantize=False,
+                                                     fake_feats=c_fake_feats,
+                                                     disable_tqdm=True)
+
+                fids.append(ifid_score)
+                # per-class wandb
+                if self.global_rank == 0 and wandb.run is not None and writing:
+                    wandb.log({f"{prefix}/class_{c}": ifid_score}, step=getattr(self, "wandb_step", None))
+
+                # save iFID values in .npz format
+                metric_dict = {"iFID": ifid_score}
+                save_dict = misc.accm_values_convert_dict(list_dict={"iFID": []},
+                                                          value_dict=metric_dict,
+                                                          step=c,
+                                                          interval=1)
+                misc.save_dict_npy(directory=join(self.RUN.save_dir, "statistics", self.run_name),
+                                   name="iFID",
+                                   dictionary=save_dict)
+
+        if self.global_rank == 0 and self.logger:
+            self.logger.info("Average iFID score ({prefix}): {iFID}".format(prefix=prefix, iFID=sum(fids, 0.0) / len(fids)))
+
+        if self.global_rank == 0 and wandb.run is not None and fids and writing:
+            wandb.log({f"{prefix}/avg": sum(fids, 0.0) / len(fids)}, step=getattr(self, "wandb_step", None))
 
         misc.make_GAN_trainable(self.Gen, self.Gen_ema, self.Dis)
 

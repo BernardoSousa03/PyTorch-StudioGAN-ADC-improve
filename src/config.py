@@ -633,40 +633,59 @@ class Configurations(object):
             print("Please use standing statistics (-std_stat) with -std_max and -std_step options for reliable evaluation!")
             print("-"*120)
 
-        # Normalize eval metric aliases and apply alias-specific defaults.
+        # Normalize eval metric aliases into explicit specs so multiple variants
+        # of the same base metric can coexist in one run.
+        import re
         raw_metrics = list(self.RUN.eval_metrics) if isinstance(self.RUN.eval_metrics, (list, tuple)) else [self.RUN.eval_metrics]
-        alias_to_metric = {
-            "fidclip50k_full": "fid",
-            "prdc50k_full": "prdc",
-        }
-        alias_num_generate = {
-            "fidclip50k_full": 50000,
-            "fid_specific_classes": 5000,
-            "prdc50k_full": 50000,
-        }
         if not hasattr(self.RUN, "eval_metrics_original"):
             self.RUN.eval_metrics_original = raw_metrics
 
-        normalized_metrics = []
-        seen = set()
+        eval_metric_specs = []
         eval_num_generate_map = {}
         for item in raw_metrics:
-            normalized_item = alias_to_metric.get(item, item)
-            if normalized_item not in seen:
-                normalized_metrics.append(normalized_item)
-                seen.add(normalized_item)
-            if item in alias_num_generate:
-                current = eval_num_generate_map.get(normalized_item, 0)
-                eval_num_generate_map[normalized_item] = max(current, alias_num_generate[item])
+            token = item.lower()
 
-        self.RUN.eval_metrics = normalized_metrics
+            if token == "fid_specific_classes":
+                eval_metric_specs.append({"metric": "fid_specific_classes",
+                                          "backbone": "CLIP_torch",
+                                          "num_generate": 5000,
+                                          "alias": item})
+                eval_num_generate_map["fid_specific_classes"] = 5000
+                continue
+
+            if token in ["is", "fid", "prdc", "ifid"]:
+                backbone = self.RUN.eval_backbone if token != "prdc" else (self.RUN.prdc_backbone if self.RUN.prdc_backbone != "N/A" else self.RUN.eval_backbone)
+                default_num = 5000 if token == "ifid" else 50000 if token == "fid_specific_classes" else None
+                num_generate = default_num if default_num is not None else 0
+                eval_metric_specs.append({"metric": token,
+                                          "backbone": backbone,
+                                          "num_generate": num_generate,
+                                          "alias": item})
+                if num_generate:
+                    eval_num_generate_map[token] = max(eval_num_generate_map.get(token, 0), num_generate)
+                continue
+
+            alias_match = re.match(r"^(fid|ifid|prdc)(clip)?_?(\d+)(k)?_?full$", token)
+            if alias_match:
+                base, clip_flag, num_str, kilo_flag = alias_match.groups()
+                num_generate = int(num_str) * (1000 if kilo_flag else 1)
+                backbone = "CLIP_torch" if clip_flag else ("VGG16_torch" if base == "prdc" else self.RUN.eval_backbone)
+                eval_metric_specs.append({"metric": base,
+                                          "backbone": backbone,
+                                          "num_generate": num_generate,
+                                          "alias": item})
+                eval_num_generate_map[base] = max(eval_num_generate_map.get(base, 0), num_generate)
+                continue
+
+            raise AssertionError(f"Unsupported metric alias: {item}")
+
+        self.RUN.eval_metrics = raw_metrics
+        self.RUN.eval_metric_specs = eval_metric_specs
         self.RUN.eval_num_generate_map = eval_num_generate_map
 
-        # Alias-driven backbone selection (only when alias metrics are requested).
-        if any(item in raw_metrics for item in ["fidclip50k_full", "fid_specific_classes"]):
-            if self.RUN.eval_backbone != "CLIP_torch":
-                print("Overriding eval_backbone to CLIP_torch for fidclip50k_full/fid_specific_classes.")
-            self.RUN.eval_backbone = "CLIP_torch"
+        # Note: do NOT override eval_backbone globally for fidclip aliases here.
+        # Backbone selection for alias-specific metrics is handled later in loader.py
+        # so multiple backbones (e.g., Inception + CLIP) can coexist in one run.
 
         if "prdc50k_full" in raw_metrics:
             if self.RUN.prdc_backbone != "VGG16_torch":
@@ -675,9 +694,10 @@ class Configurations(object):
 
         if len(self.RUN.eval_metrics):
             for item in self.RUN.eval_metrics:
-                assert item in ["is", "fid", "fid_specific_classes", "prdc", "none",
-                                "fidclip50k_full", "prdc50k_full"], \
-                    "-metrics option can only contain is, fid, fid_specific_classes, prdc or none for skipping evaluation."
+                token = item.lower()
+                valid_alias = re.match(r"^(fid|ifid|prdc)(clip)?_?(\d+)(k)?_?full$", token) is not None
+                assert token in ["is", "fid", "fid_specific_classes", "prdc", "ifid", "none"] or valid_alias, \
+                    "-metrics option can contain is, fid, ifid, fid_specific_classes, prdc, none, or aliases like fidclip50k_full / ifidclip5k_full / prdc50k_full."
 
         if self.RUN.load_data_in_memory:
             assert self.RUN.load_train_hdf5, "load_data_in_memory option is appliable with the load_train_hdf5 (-hdf5) option."

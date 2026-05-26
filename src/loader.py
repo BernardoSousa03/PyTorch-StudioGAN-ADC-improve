@@ -306,7 +306,15 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
         if override_max > num_eval[cfgs.RUN.ref_dataset]:
             num_eval[cfgs.RUN.ref_dataset] = override_max
 
+    # Load required eval models and consume normalized metric specs from config.
+    eval_model = None
+    prdc_eval_model = None
+    eval_models_map = {}
+    moments_map = {}
+    metric_specs = list(getattr(cfgs.RUN, "eval_metric_specs", []))
+
     if len(cfgs.RUN.eval_metrics) or cfgs.RUN.intra_class_fid:
+        # Always load the primary eval backbone (user-specified default)
         eval_model = pp.LoadEvalModel(eval_backbone=cfgs.RUN.eval_backbone,
                                       post_resizer=cfgs.RUN.post_resizer,
                                       world_size=cfgs.OPTIMIZATION.world_size,
@@ -315,21 +323,80 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
                                       clip_pkl_path=cfgs.RUN.clip_pkl_path,
                                       vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path,
                                       inception_pth_path=cfgs.RUN.inception_pth_path)
+        eval_models_map[cfgs.RUN.eval_backbone] = eval_model
 
-        # When prdc_backbone is set to a different backbone than eval_backbone, load a
-        # separate model for PRDC so FID uses CLIP while PRDC uses VGG16 (or any combo).
+        def ensure_model(backbone):
+            if backbone not in eval_models_map:
+                eval_models_map[backbone] = pp.LoadEvalModel(eval_backbone=backbone,
+                                                            post_resizer=cfgs.RUN.post_resizer,
+                                                            world_size=cfgs.OPTIMIZATION.world_size,
+                                                            distributed_data_parallel=cfgs.RUN.distributed_data_parallel,
+                                                            device=local_rank,
+                                                            clip_pkl_path=cfgs.RUN.clip_pkl_path,
+                                                            vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path,
+                                                            inception_pth_path=cfgs.RUN.inception_pth_path)
+            return eval_models_map[backbone]
+
+        for spec in metric_specs:
+            ensure_model(spec["backbone"])
+
+        # When prdc_backbone requested explicitly and different, create/load it
         _prdc_bb = cfgs.RUN.prdc_backbone
-        if _prdc_bb == "N/A" or _prdc_bb == cfgs.RUN.eval_backbone:
-            prdc_eval_model = eval_model  # same object — no extra memory
+        if _prdc_bb == 'N/A' or _prdc_bb == cfgs.RUN.eval_backbone:
+            prdc_eval_model = eval_models_map.get(cfgs.RUN.eval_backbone, eval_model)
         else:
-            prdc_eval_model = pp.LoadEvalModel(eval_backbone=_prdc_bb,
-                                               post_resizer=cfgs.RUN.post_resizer,
-                                               world_size=cfgs.OPTIMIZATION.world_size,
-                                               distributed_data_parallel=cfgs.RUN.distributed_data_parallel,
-                                               device=local_rank,
-                                               clip_pkl_path=cfgs.RUN.clip_pkl_path,
-                                               vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path,
-                                               inception_pth_path=cfgs.RUN.inception_pth_path)
+            if _prdc_bb in eval_models_map:
+                prdc_eval_model = eval_models_map[_prdc_bb]
+            else:
+                prdc_eval_model = pp.LoadEvalModel(eval_backbone=_prdc_bb,
+                                                   post_resizer=cfgs.RUN.post_resizer,
+                                                   world_size=cfgs.OPTIMIZATION.world_size,
+                                                   distributed_data_parallel=cfgs.RUN.distributed_data_parallel,
+                                                   device=local_rank,
+                                                   clip_pkl_path=cfgs.RUN.clip_pkl_path,
+                                                   vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path,
+                                                   inception_pth_path=cfgs.RUN.inception_pth_path)
+                eval_models_map[_prdc_bb] = prdc_eval_model
+
+        # Prepare FID moments per backbone when any fid metric spec requires them
+        for spec in metric_specs:
+            if spec['metric'] == 'fid':
+                bb = spec['backbone']
+                if bb not in moments_map:
+                    mu_bb, sigma_bb = pp.prepare_moments(data_loader=eval_dataloader,
+                                                         eval_model=eval_models_map[bb],
+                                                         quantize=True if bb in ['CLIP_torch','VGG16_torch'] else True,
+                                                         cfgs=cfgs,
+                                                         logger=logger,
+                                                         device=local_rank)
+                    moments_map[bb] = {'mu': mu_bb, 'sigma': sigma_bb}
+
+        # Prepare PRDC real features when any prdc spec exists
+        if any(spec['metric']=='prdc' for spec in metric_specs):
+            if cfgs.RUN.distributed_data_parallel:
+                prdc_sampler = DistributedSampler(eval_dataset,
+                                                  num_replicas=cfgs.OPTIMIZATION.world_size,
+                                                  rank=local_rank,
+                                                  shuffle=True,
+                                                  drop_last=False)
+            else:
+                prdc_sampler = None
+
+            prdc_dataloader = DataLoader(dataset=eval_dataset,
+                                         batch_size=cfgs.OPTIMIZATION.batch_size,
+                                         shuffle=(prdc_sampler is None),
+                                         pin_memory=True,
+                                         num_workers=cfgs.RUN.num_workers,
+                                         sampler=prdc_sampler,
+                                         drop_last=False)
+
+            real_feats = pp.prepare_real_feats(data_loader=prdc_dataloader,
+                                               eval_model=prdc_eval_model,
+                                               num_feats=num_eval[cfgs.RUN.ref_dataset],
+                                               quantize=True,
+                                               cfgs=cfgs,
+                                               logger=logger,
+                                               device=local_rank)
 
     if "fid" in cfgs.RUN.eval_metrics:
         mu, sigma = pp.prepare_moments(data_loader=eval_dataloader,
