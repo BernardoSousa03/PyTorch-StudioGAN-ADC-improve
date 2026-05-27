@@ -216,7 +216,7 @@ def prepare_moments(data_loader, eval_model, quantize, cfgs, logger, device):
     if not exists(moment_dir):
         os.makedirs(moment_dir)
     moment_path = join(moment_dir, cfgs.DATA.name + "_"  + str(cfgs.DATA.img_size) + "_"+ cfgs.RUN.pre_resizer + "_" + \
-                       cfgs.RUN.ref_dataset + "_" + cfgs.RUN.post_resizer + "_" + cfgs.RUN.eval_backbone + "_moments.npz")
+                       cfgs.RUN.ref_dataset + "_" + cfgs.RUN.post_resizer + "_" + eval_model.eval_backbone + "_moments.npz")
 
     is_file = os.path.isfile(moment_path)
     if is_file:
@@ -249,7 +249,7 @@ def prepare_real_feats(data_loader, eval_model, num_feats, quantize, cfgs, logge
     if not exists(feat_dir):
         os.makedirs(feat_dir)
     feat_path = join(feat_dir, cfgs.DATA.name + "_"  + str(cfgs.DATA.img_size) + "_"+ cfgs.RUN.pre_resizer + "_" + \
-                     cfgs.RUN.ref_dataset + "_" + cfgs.RUN.post_resizer + "_" + cfgs.RUN.eval_backbone + "_feats.npz")
+                     cfgs.RUN.ref_dataset + "_" + cfgs.RUN.post_resizer + "_" + eval_model.eval_backbone + "_feats.npz")
 
     is_file = os.path.isfile(feat_path)
     if is_file:
@@ -257,7 +257,7 @@ def prepare_real_feats(data_loader, eval_model, num_feats, quantize, cfgs, logge
     else:
         if device == 0:
             logger.info("Calculate features of {ref} dataset using {eval_backbone} model.".\
-                        format(ref=cfgs.RUN.ref_dataset, eval_backbone=cfgs.RUN.eval_backbone))
+                        format(ref=cfgs.RUN.ref_dataset, eval_backbone=eval_model.eval_backbone))
         real_feats, real_probs, real_labels = features.stack_features(data_loader=data_loader,
                                                 eval_model=eval_model,
                                                 num_feats=num_feats,
@@ -280,7 +280,7 @@ def calculate_ins(data_loader, eval_model, quantize, splits, cfgs, logger, devic
     is_acc = True if "ImageNet" in cfgs.DATA.name and "Tiny" not in cfgs.DATA.name else False
     if device == 0:
         logger.info("Calculate inception score of the {ref} dataset uisng pre-trained {eval_backbone} model.".\
-                    format(ref=cfgs.RUN.ref_dataset, eval_backbone=cfgs.RUN.eval_backbone))
+                    format(ref=cfgs.RUN.ref_dataset, eval_backbone=eval_model.eval_backbone))
     is_score, is_std, top1, top5 = ins.eval_dataset(data_loader=data_loader,
                                                     eval_model=eval_model,
                                                     quantize=quantize,
@@ -289,12 +289,12 @@ def calculate_ins(data_loader, eval_model, quantize, splits, cfgs, logger, devic
                                                     world_size=cfgs.OPTIMIZATION.world_size,
                                                     DDP=cfgs.RUN.distributed_data_parallel,
                                                     is_acc=is_acc,
-                                                    is_torch_backbone=True if "torch" in cfgs.RUN.eval_backbone else False,
+                                                    is_torch_backbone=True if "torch" in eval_model.eval_backbone else False,
                                                     disable_tqdm=disable_tqdm)
     if device == 0:
         logger.info("Inception score={is_score}-Inception_std={is_std}".format(is_score=is_score, is_std=is_std))
         if is_acc:
             logger.info("{eval_model} Top1 acc: ({num} images): {Top1}".format(
-                eval_model=cfgs.RUN.eval_backbone, num=str(len(data_loader.dataset)), Top1=top1))
+                eval_model=eval_model.eval_backbone, num=str(len(data_loader.dataset)), Top1=top1))
             logger.info("{eval_model} Top5 acc: ({num} images): {Top5}".format(
-                eval_model=cfgs.RUN.eval_backbone, num=str(len(data_loader.dataset)), Top5=top5))
+                eval_model=eval_model.eval_backbone, num=str(len(data_loader.dataset)), Top5=top5))

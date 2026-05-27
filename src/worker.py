@@ -934,6 +934,12 @@ class WORKER(object):
                             metric_dict.update({display_name: fid_score})
                             if writing:
                                 wandb.log({display_name: fid_score}, step=self.wandb_step)
+                            if backbone == self.RUN.eval_backbone:
+                                if self.best_fid is None or fid_score <= self.best_fid:
+                                    self.best_fid, self.best_step, is_best = fid_score, step, True
+                                if training:
+                                    self.logger.info("Best FID score (Step: {step}, Using {type} moments): {FID}".format(
+                                        step=self.best_step, type=self.RUN.ref_dataset, FID=self.best_fid))
 
                     elif metric == 'fid_specific_classes':
                         # keep legacy behaviour, per-class FID specific classes
@@ -1006,15 +1012,33 @@ class WORKER(object):
                         # compute intra-class FID per-spec using a helper that accepts backbone and per-class sample cap
                         num_per_class = spec.get('num_generate', None)
                         prefix = self._metric_namespace("ifid", backbone, num_per_class)
-                        self.calculate_intra_class_fid_variant(dataset=self.eval_dataloader.dataset,
+                        avg_ifid = self.calculate_intra_class_fid_variant(dataset=self.eval_dataloader.dataset,
                                                                 eval_model=self.eval_models_map.get(backbone, self.eval_model),
                                                                 num_per_class=num_per_class,
                                                                 prefix=prefix,
                                                                 writing=writing)
+                        metric_dict.update({f"{prefix}/avg": avg_ifid})
 
                 # end for metric_specs
-                # After all specs, return metric_dict for consolidated reporting
-                return metric_dict
+                # Save metric history to disk, restore GAN trainable state, and return is_best
+                if self.global_rank == 0:
+                    if training:
+                        save_dict = misc.accm_values_convert_dict(list_dict=self.metric_dict_during_train,
+                                                                  value_dict=metric_dict,
+                                                                  step=step,
+                                                                  interval=self.RUN.save_freq)
+                    else:
+                        save_dict = misc.accm_values_convert_dict(list_dict=self.metric_dict_during_final_eval,
+                                                                  value_dict=metric_dict,
+                                                                  step=None,
+                                                                  interval=None)
+
+                        misc.save_dict_npy(directory=join(self.RUN.save_dir, "statistics", self.run_name, "train" if training else "eval"),
+                                           name="metrics",
+                                           dictionary=save_dict)
+
+                misc.make_GAN_trainable(self.Gen, self.Gen_ema, self.Dis)
+                return is_best
 
             fake_feats, fake_probs, fake_labels = features.generate_images_and_stack_features(
                                                                    generator=generator,
@@ -1812,6 +1836,7 @@ class WORKER(object):
             wandb.log({f"{prefix}/avg": sum(fids, 0.0) / len(fids)}, step=getattr(self, "wandb_step", None))
 
         misc.make_GAN_trainable(self.Gen, self.Gen_ema, self.Dis)
+        return sum(fids, 0.0) / len(fids) if fids else 0.0
 
     # -----------------------------------------------------------------------------
     # perform semantic (closed-form) factorization for latent nevigation

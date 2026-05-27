@@ -69,6 +69,35 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
     if "prdc" in cfgs.RUN.eval_metrics:
         metric_dict_during_train.update({"Improved_Precision": [], "Improved_Recall": [], "Density":[], "Coverage": []})
 
+    # Also add keys for metric_specs / aliases
+    metric_specs_to_init = list(getattr(cfgs.RUN, "eval_metric_specs", []))
+    for spec in metric_specs_to_init:
+        metric = spec['metric']
+        backbone = spec.get('backbone', cfgs.RUN.eval_backbone)
+        num_generate = spec.get('num_generate', 0)
+        
+        labels = {
+            "InceptionV3_tf": "Inception",
+            "InceptionV3_torch": "Inception",
+            "ResNet50_torch": "ResNet50",
+            "SwAV_torch": "SwAV",
+            "DINO_torch": "DINO",
+            "Swin-T_torch": "SwinT",
+            "CLIP_torch": "CLIP",
+            "VGG16_torch": "VGG16",
+        }
+        backbone_label = labels.get(backbone, backbone)
+        
+        if metric == 'is':
+            metric_dict_during_train.update({"IS": [], "Top1_acc": [], "Top5_acc": []})
+        elif metric == 'fid':
+            display_name = f"FID/{backbone_label}/{num_generate}"
+            metric_dict_during_train.update({display_name: []})
+        elif metric == 'prdc':
+            metric_dict_during_train.update({"Improved_Precision": [], "Improved_Recall": [], "Density": [], "Coverage": []})
+        elif metric == 'ifid':
+            metric_dict_during_train.update({f"IFID/{backbone_label}/{num_generate}/avg": []})
+
     # -----------------------------------------------------------------------------
     # determine cuda, cudnn, and backends settings.
     # -----------------------------------------------------------------------------
@@ -470,6 +499,9 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
         num_eval=num_eval,
         loss_list_dict=loss_list_dict,
         metric_dict_during_train=metric_dict_during_train,
+        metric_specs=metric_specs,
+        eval_models_map=eval_models_map,
+        moments_map=moments_map,
     )
 
     # -----------------------------------------------------------------------------
