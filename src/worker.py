@@ -148,7 +148,7 @@ class WORKER(object):
             num_classes = num_classes*2
             self.adc_fake = True
 
-        if self.MODEL.d_cond_mtd == "AC":
+        if self.MODEL.d_cond_mtd in ["AC", "APD"]:
             self.cond_loss = losses.CrossEntropyLoss()
         elif self.MODEL.d_cond_mtd == "2C":
             self.cond_loss = losses.ConditionalContrastiveLoss(num_classes=num_classes,
@@ -337,6 +337,10 @@ class WORKER(object):
                         dis_acml_loss += self.LOSS.d_loss(fake_dict["adv_output"], self.lossy, DDP=self.DDP)
                     else:
                         dis_acml_loss = self.LOSS.d_loss(real_dict["adv_output"], fake_dict["adv_output"], DDP=self.DDP)
+                        # for APD: projection inner-product is the conditional objective, scaled by cond_lambda
+                        if self.MODEL.d_cond_mtd == "APD":
+                            dis_acml_loss += self.LOSS.cond_lambda * self.LOSS.d_loss(
+                                real_dict["proj_output"], fake_dict["proj_output"], DDP=self.DDP)
 
                     # calculate class conditioning loss defined by "MODEL.d_cond_mtd"
                     if self.MODEL.d_cond_mtd in self.MISC.classifier_based_GAN:
@@ -362,7 +366,7 @@ class WORKER(object):
                         real_prl_images = self.AUG.parallel_augment(real_images)
                         real_prl_dict = self.Dis(real_prl_images, real_labels)
                         real_consist_loss = self.l2_loss(real_dict["adv_output"], real_prl_dict["adv_output"])
-                        if self.MODEL.d_cond_mtd == "AC":
+                        if self.MODEL.d_cond_mtd in ["AC", "APD"]:
                             real_consist_loss += self.l2_loss(real_dict["cls_output"], real_prl_dict["cls_output"])
                         elif self.MODEL.d_cond_mtd in ["2C", "D2DCE"]:
                             real_consist_loss += self.l2_loss(real_dict["embed"], real_prl_dict["embed"])
@@ -378,7 +382,7 @@ class WORKER(object):
                         fake_prl_dict = self.Dis(fake_prl_images, fake_labels, adc_fake=self.adc_fake)
                         real_bcr_loss = self.l2_loss(real_dict["adv_output"], real_prl_dict["adv_output"])
                         fake_bcr_loss = self.l2_loss(fake_dict["adv_output"], fake_prl_dict["adv_output"])
-                        if self.MODEL.d_cond_mtd == "AC":
+                        if self.MODEL.d_cond_mtd in ["AC", "APD"]:
                             real_bcr_loss += self.l2_loss(real_dict["cls_output"], real_prl_dict["cls_output"])
                             fake_bcr_loss += self.l2_loss(fake_dict["cls_output"], fake_prl_dict["cls_output"])
                         elif self.MODEL.d_cond_mtd in ["2C", "D2DCE"]:
@@ -392,7 +396,7 @@ class WORKER(object):
                     if self.LOSS.apply_zcr:
                         fake_eps_dict = self.Dis(fake_images_eps, fake_labels, adc_fake=self.adc_fake)
                         fake_zcr_loss = self.l2_loss(fake_dict["adv_output"], fake_eps_dict["adv_output"])
-                        if self.MODEL.d_cond_mtd == "AC":
+                        if self.MODEL.d_cond_mtd in ["AC", "APD"]:
                             fake_zcr_loss += self.l2_loss(fake_dict["cls_output"], fake_eps_dict["cls_output"])
                         elif self.MODEL.d_cond_mtd in ["2C", "D2DCE"]:
                             fake_zcr_loss += self.l2_loss(fake_dict["embed"], fake_eps_dict["embed"])
@@ -618,6 +622,10 @@ class WORKER(object):
                             adc_fake_cond_loss = -self.cond_loss(**adc_fake_dict)
                             gen_acml_loss += self.LOSS.cond_lambda * adc_fake_cond_loss
                         pass
+                    # for APD: projection inner-product is the conditional objective, scaled by cond_lambda
+                    if self.MODEL.d_cond_mtd == "APD" and self.LOSS.adv_loss != "MH":
+                        gen_acml_loss += self.LOSS.cond_lambda * self.LOSS.g_loss(
+                            fake_dict["proj_output"], DDP=self.DDP)
 
                     # apply feature matching regularization to stabilize adversarial dynamics
                     if self.LOSS.apply_fm:

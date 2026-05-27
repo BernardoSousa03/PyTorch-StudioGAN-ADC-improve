@@ -59,7 +59,8 @@ class Configurations(object):
         self.MODEL.backbone = "resnet"
         # conditioning method of the generator \in ["W/O", "cBN", "cAdaIN"]
         self.MODEL.g_cond_mtd = "W/O"
-        # conditioning method of the discriminator \in ["W/O", "AC", "PD", "MH", "MD", "2C","D2DCE", "SPD"]
+        # conditioning method of the discriminator \in ["W/O", "AC", "PD", "APD", "MH", "MD", "2C","D2DCE", "SPD"]
+        # APD = Auxiliary classifier head (AC loss) + Projection Discriminator inner-product baked into adv_output
         self.MODEL.d_cond_mtd = "W/O"
         # type of auxiliary classifier \in ["W/O", "TAC", "ADC"]
         self.MODEL.aux_cls_type = "W/O"
@@ -342,7 +343,7 @@ class Configurations(object):
 
         self.MISC.no_proc_data = ["CIFAR10", "CIFAR100", "Tiny_ImageNet"]
         self.MISC.base_folders = ["checkpoints", "figures", "logs", "moments", "samples", "values"]
-        self.MISC.classifier_based_GAN = ["AC", "2C", "D2DCE"]
+        self.MISC.classifier_based_GAN = ["AC", "2C", "D2DCE", "APD"]
         self.MISC.info_params = ["info_discrete_linear", "info_conti_mu_linear", "info_conti_var_linear"]
         self.MISC.cas_setting = {
             "CIFAR10": {

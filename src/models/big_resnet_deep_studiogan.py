@@ -326,6 +326,10 @@ class Discriminator(nn.Module):
             self.linear2 = MODULES.d_linear(in_features=self.out_dims[-1], out_features=num_classes, bias=False)
         elif self.d_cond_mtd == "PD":
             self.embedding = MODULES.d_embedding(num_classes, self.out_dims[-1])
+        elif self.d_cond_mtd == "APD":
+            # Auxiliary classifier head (AC) + projection inner-product (PD) added to adv_output
+            self.linear2 = MODULES.d_linear(in_features=self.out_dims[-1], out_features=num_classes, bias=False)
+            self.embedding = MODULES.d_embedding(num_classes, self.out_dims[-1])
         elif self.d_cond_mtd in ["2C", "D2DCE"]:
             self.linear2 = MODULES.d_linear(in_features=self.out_dims[-1], out_features=d_embed_dim, bias=True)
             self.embedding = MODULES.d_embedding(num_classes, d_embed_dim)
@@ -356,7 +360,7 @@ class Discriminator(nn.Module):
 
     def forward(self, x, label, eval=False, adc_fake=False):
         with torch.cuda.amp.autocast() if self.mixed_precision and not eval else misc.dummy_context_mgr() as mp:
-            embed, proxy, cls_output = None, None, None
+            embed, proxy, cls_output, proj_output = None, None, None, None
             mi_embed, mi_proxy, mi_cls_output = None, None, None
             info_discrete_c_logits, info_conti_mu, info_conti_var = None, None, None
             h = self.input_conv(x)
@@ -393,6 +397,15 @@ class Discriminator(nn.Module):
                 cls_output = self.linear2(h)
             elif self.d_cond_mtd == "PD":
                 adv_output = adv_output + torch.sum(torch.mul(self.embedding(label), h), 1)
+            elif self.d_cond_mtd == "APD":
+                # projection inner-product returned separately so it can be scaled by cond_lambda
+                proj_output = torch.sum(torch.mul(self.embedding(label), h), 1)
+                # classifier head for the AC cross-entropy conditioning loss
+                if self.normalize_d_embed:
+                    for W in self.linear2.parameters():
+                        W = F.normalize(W, dim=1)
+                    h = F.normalize(h, dim=1)
+                cls_output = self.linear2(h)
             elif self.d_cond_mtd in ["2C", "D2DCE"]:
                 embed = self.linear2(h)
                 proxy = self.embedding(label)
@@ -423,6 +436,7 @@ class Discriminator(nn.Module):
         return {
             "h": h,
             "adv_output": adv_output,
+            "proj_output": proj_output,
             "embed": embed,
             "proxy": proxy,
             "cls_output": cls_output,
