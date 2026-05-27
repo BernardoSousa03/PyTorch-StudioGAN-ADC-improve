@@ -200,7 +200,7 @@ class Discriminator(nn.Module):
         # linear and embedding layers for discriminator conditioning
         if self.d_cond_mtd == "AC":
             self.linear2 = MODULES.d_linear(in_features=512, out_features=num_classes, bias=False)
-        elif self.d_cond_mtd == "PD":
+        elif self.d_cond_mtd in ["PD", "APD"]:
             self.embedding = MODULES.d_embedding(num_classes, 512)
         elif self.d_cond_mtd in ["2C", "D2DCE"]:
             self.linear2 = MODULES.d_linear(in_features=512, out_features=d_embed_dim, bias=True)
@@ -232,7 +232,7 @@ class Discriminator(nn.Module):
 
     def forward(self, x, label, eval=False, adc_fake=False):
         with torch.cuda.amp.autocast() if self.mixed_precision and not eval else misc.dummy_context_mgr() as mp:
-            embed, proxy, cls_output = None, None, None
+            embed, proxy, cls_output, proj_output = None, None, None, None
             mi_embed, mi_proxy, mi_cls_output = None, None, None
             info_discrete_c_logits, info_conti_mu, info_conti_var = None, None, None
             h = x
@@ -272,6 +272,8 @@ class Discriminator(nn.Module):
                 cls_output = self.linear2(h)
             elif self.d_cond_mtd == "PD":
                 adv_output = adv_output + torch.sum(torch.mul(self.embedding(label), h), 1)
+            elif self.d_cond_mtd == "APD":
+                proj_output = torch.sum(torch.mul(self.embedding(label), h), 1)
             elif self.d_cond_mtd in ["2C", "D2DCE"]:
                 embed = self.linear2(h)
                 proxy = self.embedding(label)
@@ -302,6 +304,7 @@ class Discriminator(nn.Module):
         return {
             "h": h,
             "adv_output": adv_output,
+            "proj_output": proj_output,
             "embed": embed,
             "proxy": proxy,
             "cls_output": cls_output,

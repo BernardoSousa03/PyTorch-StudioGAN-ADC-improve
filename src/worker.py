@@ -337,6 +337,8 @@ class WORKER(object):
                         dis_acml_loss += self.LOSS.d_loss(fake_dict["adv_output"], self.lossy, DDP=self.DDP)
                     else:
                         dis_acml_loss = self.LOSS.d_loss(real_dict["adv_output"], fake_dict["adv_output"], DDP=self.DDP)
+                        if self.MODEL.d_cond_mtd == "APD":
+                            dis_acml_loss += self.LOSS.cond_lambda * self.LOSS.d_loss(real_dict["proj_output"], fake_dict["proj_output"], DDP=self.DDP)
 
                     # calculate class conditioning loss defined by "MODEL.d_cond_mtd"
                     if self.MODEL.d_cond_mtd in self.MISC.classifier_based_GAN:
@@ -350,6 +352,8 @@ class WORKER(object):
                             dis_acml_loss += self.LOSS.cond_lambda * fake_cond_loss
                         else:
                             pass
+                    elif self.MODEL.d_cond_mtd == "APD":
+                        real_cond_loss = self.LOSS.d_loss(real_dict["proj_output"], fake_dict["proj_output"], DDP=self.DDP)
                     else:
                         real_cond_loss = "N/A"
 
@@ -618,6 +622,8 @@ class WORKER(object):
                             adc_fake_cond_loss = -self.cond_loss(**adc_fake_dict)
                             gen_acml_loss += self.LOSS.cond_lambda * adc_fake_cond_loss
                         pass
+                    elif self.MODEL.d_cond_mtd == "APD":
+                        gen_acml_loss += self.LOSS.cond_lambda * self.LOSS.g_loss(fake_dict["proj_output"], DDP=self.DDP)
 
                     # apply feature matching regularization to stabilize adversarial dynamics
                     if self.LOSS.apply_fm:
@@ -720,7 +726,7 @@ class WORKER(object):
     # -----------------------------------------------------------------------------
     def log_train_statistics(self, current_step, real_cond_loss, gen_acml_loss, dis_acml_loss):
         self.wandb_step = current_step + 1
-        if self.MODEL.d_cond_mtd in self.MISC.classifier_based_GAN:
+        if self.MODEL.d_cond_mtd in self.MISC.classifier_based_GAN or self.MODEL.d_cond_mtd == "APD":
             cls_loss = real_cond_loss.item()
         else:
             cls_loss = "N/A"
