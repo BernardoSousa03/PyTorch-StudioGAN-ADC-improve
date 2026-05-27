@@ -74,8 +74,8 @@ def calculate_pr_dc(real_feats, fake_feats, data_loader, eval_model, num_generat
                                               world_size=world_size,
                                               DDP=DDP,
                                               disable_tqdm=disable_tqdm)
-
-    real_embeds = real_feats
+    else:
+        real_embeds = real_feats
     fake_embeds = np.array(fake_feats.detach().cpu().numpy(), dtype=np.float64)[:num_generate]
 
     metrics = compute_prdc(real_features=real_embeds, fake_features=fake_embeds, nearest_k=nearest_k)

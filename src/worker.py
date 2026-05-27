@@ -1744,6 +1744,10 @@ class WORKER(object):
     def calculate_intra_class_fid_variant(self, dataset, eval_model, num_per_class=None, prefix="iFID", writing=True):
         """Calculate iFID using a specified eval_model and optional per-class sample cap.
         Logs per-class scores as `{prefix}/class_{c}` and average as `{prefix}/avg` in wandb.
+
+        NOTE: GAN state (make_GAN_untrainable / make_GAN_trainable) is managed by the
+        caller (evaluate()). Do NOT call those helpers here — doing so would restore the
+        GAN to trainable mode mid-loop, corrupting any metric specs that run after iFID.
         """
         if self.global_rank == 0:
             self.logger.info("Start calculating iFID variant (use approx. {num} fake images per class).".format(num=str(num_per_class)))
@@ -1751,10 +1755,17 @@ class WORKER(object):
         if self.gen_ctlr.standing_statistics:
             self.gen_ctlr.std_stat_counter += 1
 
+        # Build a per-class moments cache directory (backbone-specific so different
+        # eval models never collide).
+        import os
+        moment_dir = join(self.RUN.save_dir, "moments", "per_class")
+        os.makedirs(moment_dir, exist_ok=True)
+        _backbone_tag = eval_model.eval_backbone.replace("/", "-")
+        _cache_prefix = f"{self.DATA.name}_{self.DATA.img_size}_{self.RUN.pre_resizer}_{self.RUN.ref_dataset}_{self.RUN.post_resizer}_{_backbone_tag}"
+
         fids = []
         requires_grad = self.LOSS.apply_lo or self.RUN.langevin_sampling
         with torch.no_grad() if not requires_grad else misc.dummy_context_mgr() as ctx:
-            misc.make_GAN_untrainable(self.Gen, self.Gen_ema, self.Dis)
             generator, generator_mapping, generator_synthesis = self.gen_ctlr.prepare_generator()
 
             for c in tqdm(range(self.DATA.num_classes)):
@@ -1762,23 +1773,33 @@ class WORKER(object):
                 if num_per_class is not None:
                     num_samples = min(num_samples, int(num_per_class))
                 batch_size = self.OPTIMIZATION.batch_size if num_samples >= self.OPTIMIZATION.batch_size else num_samples
-                dataloader = torch.utils.data.DataLoader(dataset,
-                                                         batch_size=batch_size,
-                                                         shuffle=False,
-                                                         sampler=target_sampler,
-                                                         num_workers=self.RUN.num_workers,
-                                                         pin_memory=True,
-                                                         drop_last=False)
 
-                mu, sigma = fid.calculate_moments(data_loader=dataloader,
-                                                  eval_model=eval_model,
-                                                  num_generate="N/A",
-                                                  batch_size=batch_size,
-                                                  quantize=True,
-                                                  world_size=self.OPTIMIZATION.world_size,
-                                                  DDP=self.DDP,
-                                                  disable_tqdm=True,
-                                                  fake_feats=None)
+                # ---- Per-class real moments cache (Fix 2) ----
+                # Cache key includes backbone and class index so runs with different
+                # backbones or datasets never collide.
+                class_moment_path = join(moment_dir, f"{_cache_prefix}_class{c}_moments.npz")
+                if os.path.isfile(class_moment_path):
+                    _m = np.load(class_moment_path)
+                    mu, sigma = _m["mu"], _m["sigma"]
+                else:
+                    dataloader = torch.utils.data.DataLoader(dataset,
+                                                             batch_size=batch_size,
+                                                             shuffle=False,
+                                                             sampler=target_sampler,
+                                                             num_workers=self.RUN.num_workers,
+                                                             pin_memory=True,
+                                                             drop_last=False)
+                    mu, sigma = fid.calculate_moments(data_loader=dataloader,
+                                                      eval_model=eval_model,
+                                                      num_generate="N/A",
+                                                      batch_size=batch_size,
+                                                      quantize=True,
+                                                      world_size=self.OPTIMIZATION.world_size,
+                                                      DDP=self.DDP,
+                                                      disable_tqdm=True,
+                                                      fake_feats=None)
+                    if self.global_rank == 0:
+                        np.savez(class_moment_path, mu=mu, sigma=sigma)
 
                 c_fake_feats, _,_ = features.generate_images_and_stack_features(
                                                     generator=generator,
@@ -1835,7 +1856,7 @@ class WORKER(object):
         if self.global_rank == 0 and wandb.run is not None and fids and writing:
             wandb.log({f"{prefix}/avg": sum(fids, 0.0) / len(fids)}, step=getattr(self, "wandb_step", None))
 
-        misc.make_GAN_trainable(self.Gen, self.Gen_ema, self.Dis)
+        # GAN state is restored by the caller (evaluate()) after all specs finish.
         return sum(fids, 0.0) / len(fids) if fids else 0.0
 
     # -----------------------------------------------------------------------------
