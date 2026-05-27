@@ -94,25 +94,7 @@ class WORKER(object):
         self.metric_dict_during_final_eval = {}
         # metric_specs: list of dicts like {'metric':'fid'/'ifid'/'prdc','backbone':'CLIP_torch', 'num_generate':50000, 'alias': 'fidclip50k_full'}
         self.metric_specs = metric_specs or []
-        self.eval_models_map = eval_models_map or {self.RUN.eval_backbone: self.eval_model}
         self.moments_map = moments_map or {}
-
-    def _metric_backbone_label(self, backbone):
-        labels = {
-            "InceptionV3_tf": "Inception",
-            "InceptionV3_torch": "Inception",
-            "ResNet50_torch": "ResNet50",
-            "SwAV_torch": "SwAV",
-            "DINO_torch": "DINO",
-            "Swin-T_torch": "SwinT",
-            "CLIP_torch": "CLIP",
-            "VGG16_torch": "VGG16",
-        }
-        return labels.get(backbone, backbone)
-
-    def _metric_namespace(self, metric_name, backbone, num_generate):
-        backbone_label = self._metric_backbone_label(backbone)
-        return f"{metric_name.upper()}/{backbone_label}/{num_generate}"
 
         self.cfgs.define_augments(local_rank)
         self.cfgs.define_losses()
@@ -131,6 +113,9 @@ class WORKER(object):
         self.blur_fade_kimg = self.effective_batch_size * 200/32
         self.DDP = self.RUN.distributed_data_parallel
         self.adc_fake = False
+
+        # eval_models_map default depends on self.RUN which is set just above
+        self.eval_models_map = eval_models_map or {self.RUN.eval_backbone: self.eval_model}
 
         num_classes = self.DATA.num_classes
 
@@ -217,6 +202,23 @@ class WORKER(object):
             wandb.init(**init_kwargs)
 
         self.start_time = datetime.now()
+
+    def _metric_backbone_label(self, backbone):
+        labels = {
+            "InceptionV3_tf": "Inception",
+            "InceptionV3_torch": "Inception",
+            "ResNet50_torch": "ResNet50",
+            "SwAV_torch": "SwAV",
+            "DINO_torch": "DINO",
+            "Swin-T_torch": "SwinT",
+            "CLIP_torch": "CLIP",
+            "VGG16_torch": "VGG16",
+        }
+        return labels.get(backbone, backbone)
+
+    def _metric_namespace(self, metric_name, backbone, num_generate):
+        backbone_label = self._metric_backbone_label(backbone)
+        return f"{metric_name.upper()}/{backbone_label}/{num_generate}"
 
     def prepare_train_iter(self, epoch_counter):
         self.epoch_counter = epoch_counter

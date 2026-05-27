@@ -111,9 +111,6 @@ def load_configs_initialize_training():
                         help="path to a self-contained CLIP visual encoder pkl (no 'clip' package required). "
                              "Only used when --eval_backbone CLIP_torch. Compatible with the "
                              "clip-vit_b32.pkl format from Unconditional-Training-CGANs.")
-    parser.add_argument('--inception_pth_path', type=str, default=None,
-                        help="path to the FID InceptionV3 weights (.pth). "
-                             "Used when --eval_backbone InceptionV3_tf to avoid network downloads.")
     parser.add_argument('--prdc_backbone', type=str, default='N/A',
                         help="backbone to use specifically for PRDC. When 'N/A' (default), the main "
                              "--eval_backbone is used for all metrics. Set to 'VGG16_torch' to exactly "

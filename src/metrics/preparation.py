@@ -53,7 +53,7 @@ SWIN_URL = "https://github.com/SwinTransformer/storage/releases/download/v1.0.0/
 
 class LoadEvalModel(object):
     def __init__(self, eval_backbone, post_resizer, world_size, distributed_data_parallel, device,
-                 clip_pkl_path=None, vgg16_pkl_path=None, inception_pth_path=None):
+                 clip_pkl_path=None, vgg16_pkl_path=None):
         super(LoadEvalModel, self).__init__()
         self.eval_backbone = eval_backbone
         self.post_resizer = post_resizer
@@ -63,8 +63,7 @@ class LoadEvalModel(object):
         if self.eval_backbone == "InceptionV3_tf":
             self.res, mean, std = 299, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
             self.model = InceptionV3(resize_input=False,
-                                     normalize_input=False,
-                                     inception_pth_path=inception_pth_path).to(self.device)
+                                     normalize_input=False).to(self.device)
         elif self.eval_backbone in ["InceptionV3_torch", "ResNet50_torch", "SwAV_torch"]:
             self.res = 299 if "InceptionV3" in self.eval_backbone else 224
             mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]

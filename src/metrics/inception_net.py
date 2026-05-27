@@ -19,7 +19,7 @@ class InceptionV3(nn.Module):
 
     # Index of default block of inception to return,
     # corresponds to output of final average pooling
-    def __init__(self, resize_input=True, normalize_input=False, requires_grad=False, inception_pth_path=None):
+    def __init__(self, resize_input=True, normalize_input=False, requires_grad=False):
         """Build pretrained InceptionV3
         Parameters
         ----------
@@ -41,7 +41,7 @@ class InceptionV3(nn.Module):
         self.normalize_input = normalize_input
         self.blocks = nn.ModuleList()
 
-        state_dict, inception = fid_inception_v3(inception_pth_path)
+        state_dict, inception = fid_inception_v3()
 
         # Block 0: input to maxpool1
         block0 = [
@@ -108,7 +108,7 @@ class InceptionV3(nn.Module):
         return x, logit
 
 
-def fid_inception_v3(inception_pth_path=None):
+def fid_inception_v3():
     """Build pretrained Inception model for FID computation
     The Inception model for FID computation uses a different set of weights
     and has a slightly different structure than torchvision's Inception.
@@ -128,11 +128,8 @@ def fid_inception_v3(inception_pth_path=None):
     inception.Mixed_7c = FIDInceptionE_2(2048)
     # inception.fc = nn.Linear(2048, 1008, bias=False)
 
-    if inception_pth_path is None:
-        state_dict = load_state_dict_from_url(FID_WEIGHTS_URL, progress=True)
-    else:
-        assert exists(inception_pth_path), f"Inception weights not found at: {inception_pth_path}"
-        state_dict = torch.load(inception_pth_path, map_location="cpu")
+    # Use the original downloaded FID weights to avoid checkpoint-format drift.
+    state_dict = load_state_dict_from_url(FID_WEIGHTS_URL, progress=True)
     inception.load_state_dict(state_dict)
     return state_dict, inception
 

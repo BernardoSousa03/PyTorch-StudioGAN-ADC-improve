@@ -321,8 +321,7 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
                                       distributed_data_parallel=cfgs.RUN.distributed_data_parallel,
                                       device=local_rank,
                                       clip_pkl_path=cfgs.RUN.clip_pkl_path,
-                                      vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path,
-                                      inception_pth_path=cfgs.RUN.inception_pth_path)
+                                      vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path)
         eval_models_map[cfgs.RUN.eval_backbone] = eval_model
 
         def ensure_model(backbone):
@@ -333,8 +332,7 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
                                                             distributed_data_parallel=cfgs.RUN.distributed_data_parallel,
                                                             device=local_rank,
                                                             clip_pkl_path=cfgs.RUN.clip_pkl_path,
-                                                            vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path,
-                                                            inception_pth_path=cfgs.RUN.inception_pth_path)
+                                                            vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path)
             return eval_models_map[backbone]
 
         for spec in metric_specs:
@@ -354,8 +352,7 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
                                                    distributed_data_parallel=cfgs.RUN.distributed_data_parallel,
                                                    device=local_rank,
                                                    clip_pkl_path=cfgs.RUN.clip_pkl_path,
-                                                   vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path,
-                                                   inception_pth_path=cfgs.RUN.inception_pth_path)
+                                                   vgg16_pkl_path=cfgs.RUN.vgg16_pkl_path)
                 eval_models_map[_prdc_bb] = prdc_eval_model
 
         # Prepare FID moments per backbone when any fid metric spec requires them
